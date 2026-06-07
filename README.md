@@ -9,6 +9,8 @@ Useful for cultivar identification, contamination screening, variant-enriched re
 - **Canonical k-mers** - stores the lexicographically smaller of forward and reverse-complement, so strand is irrelevant
 - **Gzip-transparent** - reads `.gz` files directly, no decompression step needed
 - **Auto-detect format** - distinguishes FASTA (`>`) from FASTQ (`@`) automatically
+- **Memory-efficient counting** - prefix-bucketed flat hash maps use ~9 bytes/slot vs ~48 bytes for `std::unordered_map` (~39 GB vs ~144 GB for a human genome at k=21)
+- **Low-memory mode** - `--lowmem` disk-backed counting uses ~260 MB RAM regardless of genome size
 - **Streaming merge-join** - `kmer_diff` and `kmer_cosinesim` run in O(n+m) time with O(1) extra memory
 - **Binary `.kcounts` format** - sorted (hash, count) pairs for fast downstream operations
 
@@ -82,12 +84,11 @@ Count canonical 11-mers in each sample, keeping everything (minimum count 1):
 ./kmer_count -k 11 -m 1 -o sample_b.kcounts test/sample_b.fastq
 ```
 
-Output:
-```
-Counting 11-mers from test/sample_a.fastq
-  6 reads processed, 12 unique k-mers
-After min_count=1 filter: 12 k-mers
-Wrote 12 k-mers to sample_a.kcounts (binary)
+For large genomes, use `--lowmem` to cap RAM at ~260 MB (uses temp files on disk):
+
+```bash
+./kmer_count -k 21 -m 2 --lowmem -o genome.kcounts reads.fastq.gz
+./kmer_count -k 21 -m 2 --lowmem --tmpdir /scratch -o genome.kcounts reads.fastq.gz
 ```
 
 Use `-f tsv` for human-readable output:
@@ -174,7 +175,7 @@ Output:
 
 | Tool | Description |
 |------|-------------|
-| `kmer_count` | Count canonical k-mers from FASTQ/FASTA (plain or gzipped). Output as `.kcounts` binary or TSV. |
+| `kmer_count` | Count canonical k-mers from FASTQ/FASTA (plain or gzipped). Output as `.kcounts` binary or TSV. Supports `--lowmem` disk-backed mode for large genomes. |
 | `kmer_diff` | Differential k-mers between two `.kcounts` files. Streaming merge-join. |
 | `kmer_cosinesim` | Pairwise cosine similarity, Jaccard index, and angular distance across multiple samples. |
 | `kmer_reads` | Extract (or exclude) FASTQ reads matching a k-mer set from `kmer_diff`. |
@@ -193,6 +194,71 @@ Sorted binary k-mer count data:
 | entries | 12 bytes each | `uint64_t` k-mer hash + `uint32_t` count, sorted by hash |
 
 K-mers use 2-bit encoding (A=0, C=1, G=2, T=3), canonical form (min of forward and reverse complement). Max k = 31. Sorted order is required -- `kmer_diff` and `kmer_cosinesim` depend on it for merge-join.
+
+## Algorithm
+
+### K-mer encoding
+
+Each nucleotide is encoded in 2 bits (A=0, C=1, G=2, T=3), so a k-mer of length k is packed into a single `uint64_t` (max k=31, using 62 bits). For each k-mer, the canonical form is computed as the lexicographic minimum of the forward and reverse-complement encodings, making counting strand-agnostic.
+
+### Prefix-bucketed counting (k >= 9)
+
+Rather than storing all k-mers in one large hash map, `kmer_count` decomposes each canonical k-mer into two parts:
+
+```
+k-mer (2k bits):  [  prefix (16 bits)  |  suffix (2k - 16 bits)  ]
+                   top 8 bases           remaining bases
+```
+
+The 8-base prefix (16 bits) indexes into 65,536 independent flat hash map buckets. Each bucket stores only the suffix portion, which is smaller:
+
+- **k <= 24**: suffix fits in `uint32_t` (up to 32 bits)
+- **k 25-31**: suffix uses `uint64_t` (34-46 bits)
+
+This decomposition has two benefits:
+
+1. **Reduced key size** — for k <= 24, each key is 4 bytes instead of 8, saving ~30% of hash map memory
+2. **Free global sort** — iterating buckets 0 through 65,535 and sorting within each bucket produces globally sorted output, which is required by the `.kcounts` format and the downstream merge-join algorithms in `kmer_diff` and `kmer_cosinesim`
+
+#### FlatHashMap
+
+Each bucket uses a struct-of-arrays (SoA) open-addressing hash map with linear probing:
+
+| Array | Type | Description |
+|-------|------|-------------|
+| `keys[]` | `uint32_t` or `uint64_t` | Suffix values |
+| `vals[]` | `uint32_t` | Counts |
+| `state[]` | `uint8_t` | 0 = empty, 1 = occupied |
+
+At 70% load factor, this costs ~9 bytes per slot (vs ~48 bytes per entry in `std::unordered_map`). Buckets use lazy initialization — empty buckets allocate nothing, so small inputs use minimal memory regardless of k.
+
+**Estimated RAM for a human genome (~3 billion distinct 21-mers):**
+
+| Method | Per entry | Total |
+|--------|-----------|-------|
+| `std::unordered_map` | ~48 bytes | ~144 GB |
+| FlatHashMap (uint32_t suffix) | ~12.9 bytes | ~39 GB |
+
+### Disk-backed mode (`--lowmem`)
+
+When `--lowmem` is passed, suffixes are buffered in a flat array (1,024 entries per bucket, ~256 MB total for k <= 24) and flushed to per-bucket temp files on disk as the buffer fills. After scanning, each bucket file is loaded one at a time, sorted, counted by run-length, and written to the output. Only one bucket is in memory at a time during this phase.
+
+```
+Scan phase:     k-mer → prefix + suffix → buffer[prefix] → flush to disk when full
+Count phase:    for each bucket file: load → sort → run-length count → write output → delete
+```
+
+Peak RAM is ~260 MB regardless of genome size. The tradeoff is disk I/O: temp files total ~4 bytes per k-mer occurrence (e.g., ~360 GB for 30x human coverage). Use `--tmpdir` to direct temp files to fast local storage.
+
+### Small k (k <= 8)
+
+For k <= 8, the entire k-mer space fits in at most 65,536 entries (4^8), so a simple `std::unordered_map` is used without prefix decomposition. The `--lowmem` flag is accepted but ignored with a note.
+
+### Downstream tools
+
+`kmer_diff` and `kmer_cosinesim` operate on the sorted `.kcounts` files using a merge-join (two-pointer) algorithm: both files are read in sorted order, matching k-mers are compared, and unmatched entries advance the smaller pointer. This runs in O(n+m) time with O(1) extra memory — no hash tables are built.
+
+`kmer_reads` loads the differential k-mer set into a hash set, then streams the input FASTQ and emits reads containing (or lacking, with `--invert`) at least one matching k-mer.
 
 ## License
 
