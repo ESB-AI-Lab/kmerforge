@@ -1,5 +1,7 @@
 # kmertools
 
+[![DOI](https://zenodo.org/badge/1262179009.svg)](https://doi.org/10.5281/zenodo.20586122)
+
 Command-line tools for canonical k-mer counting, pairwise sample comparison, differential k-mer extraction, and read filtering on FASTQ/FASTA input (gzipped or plain).
 
 Useful for cultivar identification, contamination screening, variant-enriched read extraction, and other k-mer-level comparisons between genomes or sequencing runs.
@@ -259,6 +261,14 @@ For k <= 8, the entire k-mer space fits in at most 65,536 entries (4^8), so a si
 `kmer_diff` and `kmer_cosinesim` operate on the sorted `.kcounts` files using a merge-join (two-pointer) algorithm: both files are read in sorted order, matching k-mers are compared, and unmatched entries advance the smaller pointer. This runs in O(n+m) time with O(1) extra memory — no hash tables are built.
 
 `kmer_reads` loads the differential k-mer set into a hash set, then streams the input FASTQ and emits reads containing (or lacking, with `--invert`) at least one matching k-mer.
+
+## How to cite
+
+If you use kmertools in your research, please cite:
+
+> Solares, E. (2026). kmertools: Canonical k-mer counting, comparison, and read extraction tools. Zenodo. https://doi.org/10.5281/zenodo.20586122
+
+A BibTeX entry is provided in [CITATION.bib](CITATION.bib).
 
 ## License
 
