@@ -137,17 +137,16 @@ inline FileFormat detect_format(const char *path) {
     return (c == '>') ? FMT_FASTA : FMT_FASTQ;
 }
 
-// --- K-mer counting ---
+// --- K-mer scanning (template-based, callback receives canonical k-mers) ---
 
-inline void count_kmers_fastq(const char *path, int k,
-                              std::unordered_map<uint64_t, uint32_t> &counts) {
+template<typename EmitFn>
+void scan_kmers_fastq(const char *path, int k, EmitFn &&emit) {
     GzReader reader(path);
     uint64_t mask = (1ULL << (2 * k)) - 1;
     uint64_t n_reads = 0;
 
     while (reader.next_line()) {
         if (reader.line.empty() || reader.line[0] != '@') continue;
-
         if (!reader.next_line()) break;
         const std::string &seq = reader.line;
 
@@ -159,7 +158,7 @@ inline void count_kmers_fastq(const char *path, int k,
             fwd = ((fwd << 2) | code) & mask;
             valid++;
             if (valid >= k)
-                counts[canonical(fwd, k)]++;
+                emit(canonical(fwd, k));
         }
         n_reads++;
 
@@ -169,12 +168,12 @@ inline void count_kmers_fastq(const char *path, int k,
         if (n_reads % 1000000 == 0)
             fprintf(stderr, "\r  %lu M reads processed", n_reads / 1000000);
     }
-    fprintf(stderr, "\r  %lu reads processed, %lu unique k-mers\n",
-            n_reads, (unsigned long)counts.size());
+    fprintf(stderr, "\r  %lu reads processed\n", n_reads);
 }
 
-inline void count_kmers_fasta(const char *path, int k,
-                              std::unordered_map<uint64_t, uint32_t> &counts) {
+// FASTA: fwd/valid must persist across continuation lines within a contig
+template<typename EmitFn>
+void scan_kmers_fasta(const char *path, int k, EmitFn &&emit) {
     GzReader reader(path);
     uint64_t mask = (1ULL << (2 * k)) - 1;
     uint64_t fwd = 0;
@@ -183,8 +182,7 @@ inline void count_kmers_fasta(const char *path, int k,
 
     while (reader.next_line()) {
         if (reader.line[0] == '>') {
-            valid = 0;
-            fwd = 0;
+            valid = 0; fwd = 0;
             n_seqs++;
             if (n_seqs % 1000 == 0)
                 fprintf(stderr, "\r  %lu contigs processed", n_seqs);
@@ -197,22 +195,129 @@ inline void count_kmers_fasta(const char *path, int k,
             fwd = ((fwd << 2) | code) & mask;
             valid++;
             if (valid >= k)
-                counts[canonical(fwd, k)]++;
+                emit(canonical(fwd, k));
         }
     }
-    fprintf(stderr, "\r  %lu contigs processed, %lu unique k-mers\n",
-            n_seqs, (unsigned long)counts.size());
+    fprintf(stderr, "\r  %lu contigs processed\n", n_seqs);
 }
 
+template<typename EmitFn>
+void scan_kmers(const char *path, int k, EmitFn &&emit) {
+    if (detect_format(path) == FMT_FASTA)
+        scan_kmers_fasta(path, k, std::forward<EmitFn>(emit));
+    else
+        scan_kmers_fastq(path, k, std::forward<EmitFn>(emit));
+}
+
+// Backward-compatible wrapper using unordered_map
 inline std::unordered_map<uint64_t, uint32_t> count_kmers(const char *path, int k) {
     std::unordered_map<uint64_t, uint32_t> counts;
     counts.reserve(1 << 24);
-    if (detect_format(path) == FMT_FASTA)
-        count_kmers_fasta(path, k, counts);
-    else
-        count_kmers_fastq(path, k, counts);
+    scan_kmers(path, k, [&](uint64_t kmer) { counts[kmer]++; });
     return counts;
 }
+
+// --- FlatHashMap: open-addressing linear-probing hash map (SoA layout) ---
+
+template<typename KeyT>
+struct FlatHashMap {
+    KeyT     *keys;
+    uint32_t *vals;
+    uint8_t  *state;
+    uint32_t  capacity;
+    uint32_t  size;
+
+    FlatHashMap() : keys(nullptr), vals(nullptr), state(nullptr),
+                    capacity(0), size(0) {}
+
+    ~FlatHashMap() { free(keys); free(vals); free(state); }
+
+    FlatHashMap(const FlatHashMap &) = delete;
+    FlatHashMap &operator=(const FlatHashMap &) = delete;
+
+    FlatHashMap(FlatHashMap &&o) noexcept
+        : keys(o.keys), vals(o.vals), state(o.state),
+          capacity(o.capacity), size(o.size) {
+        o.keys = nullptr; o.vals = nullptr; o.state = nullptr;
+        o.capacity = 0; o.size = 0;
+    }
+
+    void init(uint32_t cap) {
+        capacity = cap;
+        size = 0;
+        keys  = static_cast<KeyT *>(calloc(cap, sizeof(KeyT)));
+        vals  = static_cast<uint32_t *>(calloc(cap, sizeof(uint32_t)));
+        state = static_cast<uint8_t *>(calloc(cap, sizeof(uint8_t)));
+        if (!keys || !vals || !state) {
+            fprintf(stderr, "ERROR: FlatHashMap alloc failed (cap=%u)\n", cap);
+            exit(1);
+        }
+    }
+
+    void insert_or_increment(KeyT key) {
+        if (capacity == 0) init(1024);
+        if (size * 10 >= capacity * 7) grow();
+        uint32_t h = hash_key(key) & (capacity - 1);
+        while (true) {
+            if (state[h] == 0) {
+                keys[h] = key; vals[h] = 1; state[h] = 1;
+                size++;
+                return;
+            }
+            if (keys[h] == key) { vals[h]++; return; }
+            h = (h + 1) & (capacity - 1);
+        }
+    }
+
+    void extract_sorted(uint32_t min_count,
+                        std::vector<std::pair<KeyT, uint32_t>> &out) const {
+        out.clear();
+        out.reserve(size);
+        for (uint32_t i = 0; i < capacity; i++) {
+            if (state[i] && vals[i] >= min_count)
+                out.push_back({keys[i], vals[i]});
+        }
+        std::sort(out.begin(), out.end());
+    }
+
+private:
+    void grow() {
+        uint32_t old_cap = capacity;
+        KeyT *old_keys = keys;
+        uint32_t *old_vals = vals;
+        uint8_t *old_state = state;
+
+        capacity *= 2;
+        keys  = static_cast<KeyT *>(calloc(capacity, sizeof(KeyT)));
+        vals  = static_cast<uint32_t *>(calloc(capacity, sizeof(uint32_t)));
+        state = static_cast<uint8_t *>(calloc(capacity, sizeof(uint8_t)));
+        if (!keys || !vals || !state) {
+            fprintf(stderr, "ERROR: FlatHashMap grow failed (cap=%u)\n", capacity);
+            exit(1);
+        }
+        size = 0;
+        for (uint32_t i = 0; i < old_cap; i++) {
+            if (old_state[i]) {
+                uint32_t h = hash_key(old_keys[i]) & (capacity - 1);
+                while (state[h]) h = (h + 1) & (capacity - 1);
+                keys[h] = old_keys[i]; vals[h] = old_vals[i]; state[h] = 1;
+                size++;
+            }
+        }
+        free(old_keys); free(old_vals); free(old_state);
+    }
+
+    static uint32_t hash_key(uint32_t k) {
+        k ^= k >> 16; k *= 0x45d9f3b; k ^= k >> 16;
+        k *= 0x45d9f3b; k ^= k >> 16;
+        return k;
+    }
+    static uint32_t hash_key(uint64_t k) {
+        k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33;
+        k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33;
+        return static_cast<uint32_t>(k);
+    }
+};
 
 // --- K-mer sequence decoding ---
 
