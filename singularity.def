@@ -1,0 +1,42 @@
+Bootstrap: docker
+From: debian:bookworm-slim
+
+%labels
+    Author esolares
+    Version 1.0
+    Description Canonical k-mer counting, comparison, and read extraction tools
+
+%files
+    src /opt/kmertools/src
+    Makefile /opt/kmertools/Makefile
+
+%post
+    apt-get update && \
+        apt-get install -y --no-install-recommends g++ make zlib1g-dev && \
+        rm -rf /var/lib/apt/lists/*
+
+    cd /opt/kmertools
+    make -j$(nproc)
+    cp kmer_count kmer_diff kmer_cosinesim kmer_reads /usr/local/bin/
+
+    apt-get purge -y g++ make && \
+        apt-get autoremove -y && \
+        rm -rf /opt/kmertools /var/lib/apt/lists/*
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+
+%runscript
+    exec /bin/bash "$@"
+
+%help
+    kmertools - Canonical k-mer counting, comparison, and read extraction.
+
+    Tools available:
+      kmer_count     - Count canonical k-mers from FASTQ/FASTA
+      kmer_diff      - Differential k-mers between two .kcounts files
+      kmer_cosinesim - Pairwise cosine/Jaccard/angular similarity
+      kmer_reads     - Extract reads matching a k-mer set
+
+    Usage:
+      singularity exec kmertools.sif kmer_count -k 11 -m 1 -o out.kcounts input.fastq
