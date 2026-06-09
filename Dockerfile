@@ -19,4 +19,4 @@ RUN apt-get update && \
 COPY --from=build /build/kmer_count /build/kmer_diff \
      /build/kmer_cosinesim /build/kmer_reads /usr/local/bin/
 
-ENTRYPOINT ["/bin/bash"]
+CMD ["/bin/bash"]

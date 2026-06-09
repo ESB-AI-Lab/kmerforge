@@ -57,21 +57,37 @@ Binaries are built in `build/`.
 
 ### Docker
 
+Build the image:
 ```bash
 docker build -t kmertools .
+```
+
+Run a tool (use `-v` to mount your data directory into the container):
+```bash
 docker run --rm -v $(pwd):/data kmertools kmer_count -k 11 -m 1 -o /data/out.kcounts /data/input.fastq
 ```
+
+Docker containers have no access to the host filesystem by default. The `-v $(pwd):/data` flag mounts your current directory to `/data` inside the container, so input and output files must use the `/data/` prefix.
 
 The image uses a multi-stage build -- the final image contains only the runtime dependency (zlib) and the four binaries in `/usr/local/bin/`.
 
 ### Singularity / Apptainer
 
+Build the image (requires `--fakeroot` or root):
 ```bash
-singularity build kmertools.sif singularity.def
+singularity build --fakeroot kmertools.sif singularity.def
+```
+
+Run a tool:
+```bash
 singularity exec kmertools.sif kmer_count -k 11 -m 1 -o out.kcounts input.fastq
 ```
 
-Singularity containers bind the current directory by default, so input/output files are accessible without extra flags.
+Singularity automatically binds `$HOME`, the current directory, and `/tmp` into the container, so files in those locations are accessible without extra flags. For files elsewhere, use `--bind`:
+
+```bash
+singularity exec --bind /scratch:/scratch kmertools.sif kmer_count -k 21 -m 2 -o /scratch/out.kcounts /scratch/reads.fastq.gz
+```
 
 ## Quick start
 
