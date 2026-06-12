@@ -1,4 +1,4 @@
-# kmertools
+# kmerforge
 
 [![DOI](https://zenodo.org/badge/1262179009.svg)](https://doi.org/10.5281/zenodo.20586122)
 
@@ -37,8 +37,8 @@ xcode-select --install
 ### Make (recommended)
 
 ```bash
-git clone https://github.com/esolares/kmertools.git
-cd kmertools
+git clone https://github.com/esolares/kmerforge.git
+cd kmerforge
 make -j$(nproc)
 ```
 
@@ -47,8 +47,8 @@ Binaries are built in the project root: `kmer_count`, `kmer_diff`, `kmer_cosines
 ### CMake
 
 ```bash
-git clone https://github.com/esolares/kmertools.git
-cd kmertools
+git clone https://github.com/esolares/kmerforge.git
+cd kmerforge
 cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
@@ -59,12 +59,12 @@ Binaries are built in `build/`.
 
 Build the image:
 ```bash
-docker build -t kmertools .
+docker build -t kmerforge .
 ```
 
 Run a tool (use `-v` to mount your data directory into the container):
 ```bash
-docker run --rm -v $(pwd):/data kmertools kmer_count -k 11 -m 1 -o /data/out.kcounts /data/input.fastq
+docker run --rm -v $(pwd):/data kmerforge kmer_count -k 11 -m 1 -o /data/out.kcounts /data/input.fastq
 ```
 
 Docker containers have no access to the host filesystem by default. The `-v $(pwd):/data` flag mounts your current directory to `/data` inside the container, so input and output files must use the `/data/` prefix.
@@ -75,18 +75,18 @@ The image uses a multi-stage build -- the final image contains only the runtime 
 
 Build the image (requires `--fakeroot` or root):
 ```bash
-singularity build --fakeroot kmertools.sif singularity.def
+singularity build --fakeroot kmerforge.sif singularity.def
 ```
 
 Run a tool:
 ```bash
-singularity exec kmertools.sif kmer_count -k 11 -m 1 -o out.kcounts input.fastq
+singularity exec kmerforge.sif kmer_count -k 11 -m 1 -o out.kcounts input.fastq
 ```
 
 Singularity automatically binds `$HOME`, the current directory, and `/tmp` into the container, so files in those locations are accessible without extra flags. For files elsewhere, use `--bind`:
 
 ```bash
-singularity exec --bind /scratch:/scratch kmertools.sif kmer_count -k 21 -m 2 -o /scratch/out.kcounts /scratch/reads.fastq.gz
+singularity exec --bind /scratch:/scratch kmerforge.sif kmer_count -k 21 -m 2 -o /scratch/out.kcounts /scratch/reads.fastq.gz
 ```
 
 ## Quick start
@@ -280,9 +280,9 @@ For k <= 8, the entire k-mer space fits in at most 65,536 entries (4^8), so a si
 
 ## How to cite
 
-If you use kmertools in your research, please cite:
+If you use kmerforge in your research, please cite:
 
-> Solares, E. (2026). kmertools: Canonical k-mer counting, comparison, and read extraction tools. Zenodo. https://doi.org/10.5281/zenodo.20586122
+> Solares, E. (2026). kmerforge: Canonical k-mer counting, comparison, and read extraction tools. Zenodo. https://doi.org/10.5281/zenodo.20586122
 
 A BibTeX entry is provided in [CITATION.bib](CITATION.bib).
 
