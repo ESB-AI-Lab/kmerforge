@@ -319,6 +319,110 @@ private:
     }
 };
 
+// --- Compact quotient hash set ---
+//
+// Memory-efficient static set for uint64_t keys. Uses the Jellyfish-style
+// technique: table index encodes L bits of the key, only the remaining
+// (64-L) bits + 1 occupied bit are stored per slot. ~5-6 bytes/entry at
+// 80% load vs ~60 bytes/entry for std::unordered_set.
+
+class CompactHashSet {
+    uint32_t L_;
+    uint32_t R_;
+    uint32_t slot_bytes_;
+    uint64_t mask_;
+    size_t n_elements_;
+    std::vector<uint8_t> storage_;
+
+    static uint64_t mix(uint64_t h) {
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        h *= 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+        return h;
+    }
+
+    static uint64_t next_pow2(uint64_t v) {
+        v--;
+        v |= v >> 1;  v |= v >> 2;  v |= v >> 4;
+        v |= v >> 8;  v |= v >> 16; v |= v >> 32;
+        return v + 1;
+    }
+
+    uint64_t read_slot(size_t idx) const {
+        uint64_t val = 0;
+        memcpy(&val, &storage_[idx * slot_bytes_], slot_bytes_);
+        return val;
+    }
+
+    void write_slot(size_t idx, uint64_t val) {
+        memcpy(&storage_[idx * slot_bytes_], &val, slot_bytes_);
+    }
+
+public:
+    CompactHashSet() : L_(0), R_(64), slot_bytes_(0), mask_(0), n_elements_(0) {}
+
+    explicit CompactHashSet(const std::vector<uint64_t> &keys, double load_factor = 0.8) {
+        n_elements_ = keys.size();
+        if (n_elements_ == 0) {
+            L_ = 0; R_ = 64; slot_bytes_ = 0; mask_ = 0;
+            return;
+        }
+
+        uint64_t table_size = next_pow2((uint64_t)(n_elements_ / load_factor) + 1);
+        if (table_size < 16) table_size = 16;
+
+        L_ = 0;
+        for (uint64_t v = table_size; v > 1; v >>= 1) L_++;
+        R_ = 64 - L_;
+        slot_bytes_ = (R_ + 1 + 7) / 8;
+        mask_ = table_size - 1;
+
+        storage_.assign((size_t)table_size * slot_bytes_, 0);
+
+        for (uint64_t key : keys) {
+            uint64_t h = mix(key);
+            uint64_t idx = h & mask_;
+            uint64_t rem = h >> L_;
+            uint64_t packed = (rem << 1) | 1;
+
+            while (true) {
+                uint64_t val = read_slot(idx);
+                if (!(val & 1)) {
+                    write_slot(idx, packed);
+                    break;
+                }
+                if (val == packed) break;
+                idx = (idx + 1) & mask_;
+            }
+        }
+    }
+
+    bool contains(uint64_t key) const {
+        if (storage_.empty()) return false;
+        uint64_t h = mix(key);
+        uint64_t idx = h & mask_;
+        uint64_t packed = ((h >> L_) << 1) | 1;
+
+        while (true) {
+            uint64_t val = read_slot(idx);
+            if (!(val & 1)) return false;
+            if (val == packed) return true;
+            idx = (idx + 1) & mask_;
+        }
+    }
+
+    size_t size() const { return n_elements_; }
+    size_t capacity() const { return mask_ ? mask_ + 1 : 0; }
+    size_t memory_bytes() const { return storage_.size(); }
+
+    CompactHashSet(const CompactHashSet&) = delete;
+    CompactHashSet& operator=(const CompactHashSet&) = delete;
+    CompactHashSet(CompactHashSet&&) = default;
+    CompactHashSet& operator=(CompactHashSet&&) = default;
+};
+
 // --- K-mer sequence decoding ---
 
 inline std::string decode_kmer(uint64_t val, int k) {
