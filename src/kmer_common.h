@@ -17,6 +17,8 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <functional>
+#include <unistd.h>
 #include <zlib.h>
 
 // --- 2-bit nucleotide encoding: A=0, C=1, G=2, T=3, else=4 ---
@@ -422,6 +424,374 @@ public:
     CompactHashSet(CompactHashSet&&) = default;
     CompactHashSet& operator=(CompactHashSet&&) = default;
 };
+
+// --- Bucketed k-mer counting ---
+//
+// Efficient k-mer counting using prefix bucketing. Two modes:
+//   MemBucketCounter  — in-memory FlatHashMap per bucket (~9-13 bytes/entry)
+//   DiskBucketCounter — disk-backed temp files (~260 MB RAM total)
+
+inline constexpr int KMER_PREFIX_BASES = 8;
+inline constexpr int KMER_PREFIX_BITS  = 2 * KMER_PREFIX_BASES;
+inline constexpr int KMER_NUM_BUCKETS  = 1 << KMER_PREFIX_BITS; // 65536
+
+template<typename SuffixT>
+struct MemBucketCounter {
+    int k, suffix_bits;
+    uint64_t suffix_mask;
+    FlatHashMap<SuffixT> buckets[KMER_NUM_BUCKETS];
+
+    explicit MemBucketCounter(int k_) : k(k_) {
+        suffix_bits = 2 * k - KMER_PREFIX_BITS;
+        suffix_mask = (1ULL << suffix_bits) - 1;
+    }
+
+    void operator()(uint64_t kmer) {
+        uint32_t prefix = static_cast<uint32_t>(kmer >> suffix_bits);
+        SuffixT suffix = static_cast<SuffixT>(kmer & suffix_mask);
+        buckets[prefix].insert_or_increment(suffix);
+    }
+
+    uint64_t total_unique() const {
+        uint64_t n = 0;
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) n += buckets[b].size;
+        return n;
+    }
+
+    void extract_kmers(uint32_t min_count, uint32_t max_count,
+                       std::vector<uint64_t> &out) {
+        out.clear();
+        std::vector<std::pair<SuffixT, uint32_t>> entries;
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
+            buckets[b].extract_sorted(min_count, entries);
+            for (auto &[suffix, count] : entries) {
+                if (max_count > 0 && count > max_count) continue;
+                out.push_back((static_cast<uint64_t>(b) << suffix_bits) | suffix);
+            }
+        }
+    }
+
+    void write_output(const char *path, uint32_t min_count, bool is_tsv) {
+        FILE *fp;
+        if (is_tsv) {
+            fp = (path && path[0]) ? fopen(path, "w") : stdout;
+        } else {
+            fp = fopen(path, "wb");
+        }
+        if (!fp) { perror("fopen output"); exit(1); }
+
+        if (!is_tsv) write_kcounts_header(fp, static_cast<uint32_t>(k), 0);
+
+        uint64_t total = 0;
+        std::vector<std::pair<SuffixT, uint32_t>> entries;
+
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
+            buckets[b].extract_sorted(min_count, entries);
+            for (auto &[suffix, count] : entries) {
+                uint64_t full = (static_cast<uint64_t>(b) << suffix_bits) | suffix;
+                if (is_tsv)
+                    fprintf(fp, "%lu\t%u\n", (unsigned long)full, count);
+                else
+                    write_kmer_entry(fp, full, count);
+                total++;
+            }
+        }
+
+        if (!is_tsv) {
+            fseek(fp, 8, SEEK_SET);
+            fwrite(&total, 8, 1, fp);
+        }
+        if (fp != stdout) fclose(fp);
+
+        fprintf(stderr, "After min_count=%u filter: %lu k-mers\n",
+                min_count, (unsigned long)total);
+        if (is_tsv)
+            fprintf(stderr, "Wrote %lu k-mers (TSV)\n", (unsigned long)total);
+        else
+            fprintf(stderr, "Wrote %lu k-mers to %s (binary)\n",
+                    (unsigned long)total, path);
+    }
+};
+
+inline std::string create_kmer_tmpdir(const std::string &base) {
+    std::string tmpl = base + "/kmertools_XXXXXX";
+    char *result = mkdtemp(&tmpl[0]);
+    if (!result) {
+        perror("mkdtemp");
+        fprintf(stderr, "ERROR: Cannot create temp directory under %s\n", base.c_str());
+        exit(1);
+    }
+    return std::string(result);
+}
+
+template<typename SuffixT>
+struct DiskBucketCounter {
+    int k, suffix_bits;
+    uint64_t suffix_mask;
+    std::string tmpdir;
+
+    static constexpr size_t BUF_ENTRIES = 1024;
+    SuffixT *buffer_storage;
+    size_t buf_pos[KMER_NUM_BUCKETS];
+
+    DiskBucketCounter(int k_, const std::string &tmpdir_) : k(k_), tmpdir(tmpdir_) {
+        suffix_bits = 2 * k - KMER_PREFIX_BITS;
+        suffix_mask = (1ULL << suffix_bits) - 1;
+        buffer_storage = static_cast<SuffixT *>(
+            calloc(static_cast<size_t>(KMER_NUM_BUCKETS) * BUF_ENTRIES, sizeof(SuffixT)));
+        if (!buffer_storage) {
+            fprintf(stderr, "ERROR: DiskBucketCounter buffer alloc failed\n");
+            exit(1);
+        }
+        memset(buf_pos, 0, sizeof(buf_pos));
+    }
+
+    ~DiskBucketCounter() {
+        free(buffer_storage);
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++)
+            remove(bucket_path(b).c_str());
+        rmdir(tmpdir.c_str());
+    }
+
+    DiskBucketCounter(const DiskBucketCounter &) = delete;
+    DiskBucketCounter &operator=(const DiskBucketCounter &) = delete;
+
+    std::string bucket_path(int b) const {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "/b%05d.tmp", b);
+        return tmpdir + buf;
+    }
+
+    SuffixT *bucket_buf(int b) {
+        return buffer_storage + static_cast<size_t>(b) * BUF_ENTRIES;
+    }
+
+    void flush_bucket(int b) {
+        if (buf_pos[b] == 0) return;
+        FILE *fp = fopen(bucket_path(b).c_str(), "ab");
+        if (!fp) { perror("fopen bucket"); exit(1); }
+        fwrite(bucket_buf(b), sizeof(SuffixT), buf_pos[b], fp);
+        fclose(fp);
+        buf_pos[b] = 0;
+    }
+
+    void operator()(uint64_t kmer) {
+        uint32_t prefix = static_cast<uint32_t>(kmer >> suffix_bits);
+        SuffixT suffix = static_cast<SuffixT>(kmer & suffix_mask);
+        bucket_buf(prefix)[buf_pos[prefix]++] = suffix;
+        if (buf_pos[prefix] == BUF_ENTRIES)
+            flush_bucket(prefix);
+    }
+
+    void flush_all() {
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++)
+            flush_bucket(b);
+    }
+
+    void extract_kmers(uint32_t min_count, uint32_t max_count,
+                       std::vector<uint64_t> &out) {
+        flush_all();
+        out.clear();
+        std::vector<SuffixT> suffixes;
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
+            std::string bpath = bucket_path(b);
+            FILE *bf = fopen(bpath.c_str(), "rb");
+            if (!bf) continue;
+            fseek(bf, 0, SEEK_END);
+            long fsize = ftell(bf);
+            fseek(bf, 0, SEEK_SET);
+            size_t n = static_cast<size_t>(fsize) / sizeof(SuffixT);
+            suffixes.resize(n);
+            if (fread(suffixes.data(), sizeof(SuffixT), n, bf) != n) {
+                fclose(bf);
+                continue;
+            }
+            fclose(bf);
+            std::sort(suffixes.begin(), suffixes.end());
+            size_t i = 0;
+            while (i < n) {
+                SuffixT s = suffixes[i];
+                uint32_t count = 1;
+                while (i + count < n && suffixes[i + count] == s)
+                    count++;
+                if (count >= min_count && (max_count == 0 || count <= max_count))
+                    out.push_back((static_cast<uint64_t>(b) << suffix_bits) | s);
+                i += count;
+            }
+            remove(bpath.c_str());
+            if (b % 10000 == 0 && b > 0)
+                fprintf(stderr, "\r  Processing bucket %d / %d", b, KMER_NUM_BUCKETS);
+        }
+        fprintf(stderr, "\r  Extracted %lu k-mers                    \n",
+                (unsigned long)out.size());
+    }
+
+    void write_output(const char *path, uint32_t min_count, bool is_tsv) {
+        flush_all();
+
+        FILE *fp;
+        if (is_tsv) {
+            fp = (path && path[0]) ? fopen(path, "w") : stdout;
+        } else {
+            fp = fopen(path, "wb");
+        }
+        if (!fp) { perror("fopen output"); exit(1); }
+
+        if (!is_tsv) write_kcounts_header(fp, static_cast<uint32_t>(k), 0);
+
+        uint64_t total = 0;
+        std::vector<SuffixT> suffixes;
+
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
+            std::string bpath = bucket_path(b);
+            FILE *bf = fopen(bpath.c_str(), "rb");
+            if (!bf) continue;
+
+            fseek(bf, 0, SEEK_END);
+            long fsize = ftell(bf);
+            fseek(bf, 0, SEEK_SET);
+            size_t n = static_cast<size_t>(fsize) / sizeof(SuffixT);
+
+            suffixes.resize(n);
+            if (fread(suffixes.data(), sizeof(SuffixT), n, bf) != n) {
+                fprintf(stderr, "ERROR: short read on bucket %d\n", b);
+                fclose(bf);
+                continue;
+            }
+            fclose(bf);
+
+            std::sort(suffixes.begin(), suffixes.end());
+
+            size_t i = 0;
+            while (i < n) {
+                SuffixT s = suffixes[i];
+                uint32_t count = 1;
+                while (i + count < n && suffixes[i + count] == s)
+                    count++;
+                if (count >= min_count) {
+                    uint64_t full = (static_cast<uint64_t>(b) << suffix_bits) | s;
+                    if (is_tsv)
+                        fprintf(fp, "%lu\t%u\n", (unsigned long)full, count);
+                    else
+                        write_kmer_entry(fp, full, count);
+                    total++;
+                }
+                i += count;
+            }
+
+            remove(bpath.c_str());
+
+            if (b % 10000 == 0 && b > 0)
+                fprintf(stderr, "\r  Processing bucket %d / %d", b, KMER_NUM_BUCKETS);
+        }
+
+        if (!is_tsv) {
+            fseek(fp, 8, SEEK_SET);
+            fwrite(&total, 8, 1, fp);
+        }
+        if (fp != stdout) fclose(fp);
+
+        fprintf(stderr, "\rAfter min_count=%u filter: %lu k-mers\n",
+                min_count, (unsigned long)total);
+        if (is_tsv)
+            fprintf(stderr, "Wrote %lu k-mers (TSV)\n", (unsigned long)total);
+        else
+            fprintf(stderr, "Wrote %lu k-mers to %s (binary)\n",
+                    (unsigned long)total, path);
+    }
+};
+
+// --- High-level k-mer counting helpers ---
+
+namespace detail {
+template<typename SuffixT>
+inline void count_kmers_bucketed(const char *path, int k,
+                                  uint32_t min_count, uint32_t max_count,
+                                  std::vector<uint64_t> &out,
+                                  bool lowmem,
+                                  const std::string &tmpdir_base) {
+    if (lowmem) {
+        std::string base = tmpdir_base;
+        if (base.empty()) {
+            const char *env = getenv("TMPDIR");
+            base = env ? env : "/tmp";
+        }
+        std::string tmpdir = create_kmer_tmpdir(base);
+        fprintf(stderr, "  Temp directory: %s\n", tmpdir.c_str());
+        DiskBucketCounter<SuffixT> counter(k, tmpdir);
+        scan_kmers(path, k, std::ref(counter));
+        counter.extract_kmers(min_count, max_count, out);
+    } else {
+        MemBucketCounter<SuffixT> counter(k);
+        scan_kmers(path, k, std::ref(counter));
+        fprintf(stderr, "  %lu unique k-mers found\n",
+                (unsigned long)counter.total_unique());
+        counter.extract_kmers(min_count, max_count, out);
+        fprintf(stderr, "  %lu k-mers after filtering\n", (unsigned long)out.size());
+    }
+}
+} // namespace detail
+
+inline void count_kmers_filtered(const char *path, int k,
+                                  uint32_t min_count, uint32_t max_count,
+                                  std::vector<uint64_t> &out,
+                                  bool lowmem = false,
+                                  const std::string &tmpdir_base = "") {
+    if (k <= 8) {
+        auto counts = count_kmers(path, k);
+        uint64_t total = counts.size();
+        out.clear();
+        out.reserve(total);
+        for (auto &[kmer, cnt] : counts) {
+            if (cnt >= min_count && (max_count == 0 || cnt <= max_count))
+                out.push_back(kmer);
+        }
+        fprintf(stderr, "  %lu unique k-mers, %lu after filtering\n",
+                (unsigned long)total, (unsigned long)out.size());
+    } else if (k <= 24) {
+        detail::count_kmers_bucketed<uint32_t>(path, k, min_count, max_count,
+                                                out, lowmem, tmpdir_base);
+    } else {
+        detail::count_kmers_bucketed<uint64_t>(path, k, min_count, max_count,
+                                                out, lowmem, tmpdir_base);
+    }
+}
+
+inline void load_kcounts_kmers(const char *path, int expected_k,
+                                uint32_t min_count, uint32_t max_count,
+                                std::vector<uint64_t> &out,
+                                uint64_t *total_out = nullptr) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ERROR: Cannot open .kcounts file: %s\n", path);
+        exit(1);
+    }
+    KcountsHeader hdr;
+    if (!read_kcounts_header(fp, hdr)) {
+        fprintf(stderr, "ERROR: Invalid .kcounts file: %s\n", path);
+        fclose(fp);
+        exit(1);
+    }
+    if ((int)hdr.k != expected_k) {
+        fprintf(stderr, "ERROR: .kcounts k=%u but expected k=%d in file: %s\n",
+                hdr.k, expected_k, path);
+        fclose(fp);
+        exit(1);
+    }
+    out.clear();
+    if (hdr.n > 0) out.reserve(hdr.n);
+    uint64_t total = 0;
+    KmerEntry e;
+    while (read_kmer_entry(fp, e)) {
+        total++;
+        if (e.count >= min_count && (max_count == 0 || e.count <= max_count))
+            out.push_back(e.kmer);
+    }
+    fclose(fp);
+    if (total_out) *total_out = total;
+    fprintf(stderr, "  Loaded %lu k-mers, %lu after filtering (k=%d)\n",
+            (unsigned long)total, (unsigned long)out.size(), expected_k);
+}
 
 // --- K-mer sequence decoding ---
 

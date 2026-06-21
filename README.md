@@ -200,6 +200,30 @@ Output:
 
 Run any tool with `-h` for full options.
 
+## Library usage (kmer_common.h)
+
+The shared header `src/kmer_common.h` exposes the counting infrastructure for use by other C++ tools:
+
+```cpp
+#include "kmer_common.h"
+
+// Bucketed in-memory counting (~9-13 bytes/k-mer)
+std::vector<uint64_t> kmers;
+count_kmers_filtered("reads.fastq.gz", 21, /*min_count=*/2, /*max_count=*/0, kmers);
+
+// Disk-backed counting (~260 MB RAM)
+count_kmers_filtered("reads.fastq.gz", 21, 2, 0, kmers, /*lowmem=*/true, "/tmp");
+
+// Load pre-computed .kcounts file
+load_kcounts_kmers("counts.kcounts", 21, 2, 0, kmers);
+
+// Build compact membership set (~5-6 bytes/entry)
+CompactHashSet kmer_set(kmers);
+bool found = kmer_set.contains(some_kmer);
+```
+
+Available types: `MemBucketCounter`, `DiskBucketCounter`, `FlatHashMap`, `CompactHashSet`, and the high-level helpers `count_kmers_filtered()` and `load_kcounts_kmers()`.
+
 ## .kcounts format
 
 Sorted binary k-mer count data:
