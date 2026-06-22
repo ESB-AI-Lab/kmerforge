@@ -232,7 +232,14 @@ struct FlatHashMap {
     FlatHashMap() : keys(nullptr), vals(nullptr), state(nullptr),
                     capacity(0), size(0) {}
 
-    ~FlatHashMap() { free(keys); free(vals); free(state); }
+    ~FlatHashMap() { release(); }
+
+    void release() {
+        free(keys); keys = nullptr;
+        free(vals); vals = nullptr;
+        free(state); state = nullptr;
+        capacity = 0; size = 0;
+    }
 
     FlatHashMap(const FlatHashMap &) = delete;
     FlatHashMap &operator=(const FlatHashMap &) = delete;
@@ -464,11 +471,37 @@ struct MemBucketCounter {
         std::vector<std::pair<SuffixT, uint32_t>> entries;
         for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
             buckets[b].extract_sorted(min_count, entries);
+            buckets[b].release();
             for (auto &[suffix, count] : entries) {
                 if (max_count > 0 && count > max_count) continue;
                 out.push_back((static_cast<uint64_t>(b) << suffix_bits) | suffix);
             }
         }
+    }
+
+    void partition_against(uint32_t min_count, uint32_t max_count,
+                           const CompactHashSet &ref_set,
+                           std::vector<uint64_t> &out_match,
+                           uint64_t &out_nonmatch_count) {
+        out_match.clear();
+        out_nonmatch_count = 0;
+        std::vector<std::pair<SuffixT, uint32_t>> entries;
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
+            buckets[b].extract_sorted(min_count, entries);
+            buckets[b].release();
+            for (auto &[suffix, count] : entries) {
+                if (max_count > 0 && count > max_count) continue;
+                uint64_t kmer = (static_cast<uint64_t>(b) << suffix_bits) | suffix;
+                if (ref_set.contains(kmer))
+                    out_match.push_back(kmer);
+                else
+                    out_nonmatch_count++;
+            }
+            if (b % 10000 == 0 && b > 0)
+                fprintf(stderr, "\r       Partitioning: bucket %d / %d", b, KMER_NUM_BUCKETS);
+        }
+        if (KMER_NUM_BUCKETS > 10000)
+            fprintf(stderr, "\r       Partitioning: done                          \n");
     }
 
     void write_output(const char *path, uint32_t min_count, bool is_tsv) {
@@ -626,6 +659,52 @@ struct DiskBucketCounter {
                 (unsigned long)out.size());
     }
 
+    void partition_against(uint32_t min_count, uint32_t max_count,
+                           const CompactHashSet &ref_set,
+                           std::vector<uint64_t> &out_match,
+                           uint64_t &out_nonmatch_count) {
+        flush_all();
+        out_match.clear();
+        out_nonmatch_count = 0;
+        std::vector<SuffixT> suffixes;
+        for (int b = 0; b < KMER_NUM_BUCKETS; b++) {
+            std::string bpath = bucket_path(b);
+            FILE *bf = fopen(bpath.c_str(), "rb");
+            if (!bf) continue;
+            fseek(bf, 0, SEEK_END);
+            long fsize = ftell(bf);
+            fseek(bf, 0, SEEK_SET);
+            size_t n = static_cast<size_t>(fsize) / sizeof(SuffixT);
+            suffixes.resize(n);
+            if (fread(suffixes.data(), sizeof(SuffixT), n, bf) != n) {
+                fclose(bf);
+                continue;
+            }
+            fclose(bf);
+            std::sort(suffixes.begin(), suffixes.end());
+            size_t i = 0;
+            while (i < n) {
+                SuffixT s = suffixes[i];
+                uint32_t count = 1;
+                while (i + count < n && suffixes[i + count] == s)
+                    count++;
+                if (count >= min_count && (max_count == 0 || count <= max_count)) {
+                    uint64_t kmer = (static_cast<uint64_t>(b) << suffix_bits) | s;
+                    if (ref_set.contains(kmer))
+                        out_match.push_back(kmer);
+                    else
+                        out_nonmatch_count++;
+                }
+                i += count;
+            }
+            remove(bpath.c_str());
+            if (b % 10000 == 0 && b > 0)
+                fprintf(stderr, "\r       Partitioning: bucket %d / %d", b, KMER_NUM_BUCKETS);
+        }
+        if (KMER_NUM_BUCKETS > 10000)
+            fprintf(stderr, "\r       Partitioning: done                          \n");
+    }
+
     void write_output(const char *path, uint32_t min_count, bool is_tsv) {
         flush_all();
 
@@ -730,6 +809,35 @@ inline void count_kmers_bucketed(const char *path, int k,
         fprintf(stderr, "  %lu k-mers after filtering\n", (unsigned long)out.size());
     }
 }
+template<typename SuffixT>
+inline void count_and_partition(const char *path, int k,
+                                uint32_t min_count, uint32_t max_count,
+                                const CompactHashSet &ref_set,
+                                std::vector<uint64_t> &out_match,
+                                uint64_t &out_nonmatch_count,
+                                bool lowmem,
+                                const std::string &tmpdir_base) {
+    if (lowmem) {
+        std::string base = tmpdir_base;
+        if (base.empty()) {
+            const char *env = getenv("TMPDIR");
+            base = env ? env : "/tmp";
+        }
+        std::string tmpdir = create_kmer_tmpdir(base);
+        fprintf(stderr, "  Temp directory: %s\n", tmpdir.c_str());
+        DiskBucketCounter<SuffixT> counter(k, tmpdir);
+        scan_kmers(path, k, std::ref(counter));
+        counter.partition_against(min_count, max_count, ref_set,
+                                  out_match, out_nonmatch_count);
+    } else {
+        MemBucketCounter<SuffixT> counter(k);
+        scan_kmers(path, k, std::ref(counter));
+        fprintf(stderr, "  %lu unique k-mers found\n",
+                (unsigned long)counter.total_unique());
+        counter.partition_against(min_count, max_count, ref_set,
+                                  out_match, out_nonmatch_count);
+    }
+}
 } // namespace detail
 
 inline void count_kmers_filtered(const char *path, int k,
@@ -754,6 +862,36 @@ inline void count_kmers_filtered(const char *path, int k,
     } else {
         detail::count_kmers_bucketed<uint64_t>(path, k, min_count, max_count,
                                                 out, lowmem, tmpdir_base);
+    }
+}
+
+inline void count_and_partition(const char *path, int k,
+                                 uint32_t min_count, uint32_t max_count,
+                                 const CompactHashSet &ref_set,
+                                 std::vector<uint64_t> &out_match,
+                                 uint64_t &out_nonmatch_count,
+                                 bool lowmem = false,
+                                 const std::string &tmpdir_base = "") {
+    if (k <= 8) {
+        auto counts = count_kmers(path, k);
+        out_match.clear();
+        out_nonmatch_count = 0;
+        for (auto &[kmer, cnt] : counts) {
+            if (cnt >= min_count && (max_count == 0 || cnt <= max_count)) {
+                if (ref_set.contains(kmer))
+                    out_match.push_back(kmer);
+                else
+                    out_nonmatch_count++;
+            }
+        }
+    } else if (k <= 24) {
+        detail::count_and_partition<uint32_t>(path, k, min_count, max_count,
+                                              ref_set, out_match, out_nonmatch_count,
+                                              lowmem, tmpdir_base);
+    } else {
+        detail::count_and_partition<uint64_t>(path, k, min_count, max_count,
+                                              ref_set, out_match, out_nonmatch_count,
+                                              lowmem, tmpdir_base);
     }
 }
 
