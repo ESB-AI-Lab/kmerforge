@@ -226,8 +226,8 @@ struct FlatHashMap {
     KeyT     *keys;
     uint32_t *vals;
     uint8_t  *state;
-    uint32_t  capacity;
-    uint32_t  size;
+    size_t    capacity;
+    size_t    size;
 
     FlatHashMap() : keys(nullptr), vals(nullptr), state(nullptr),
                     capacity(0), size(0) {}
@@ -251,14 +251,14 @@ struct FlatHashMap {
         o.capacity = 0; o.size = 0;
     }
 
-    void init(uint32_t cap) {
+    void init(size_t cap) {
         capacity = cap;
         size = 0;
         keys  = static_cast<KeyT *>(calloc(cap, sizeof(KeyT)));
         vals  = static_cast<uint32_t *>(calloc(cap, sizeof(uint32_t)));
         state = static_cast<uint8_t *>(calloc(cap, sizeof(uint8_t)));
         if (!keys || !vals || !state) {
-            fprintf(stderr, "ERROR: FlatHashMap alloc failed (cap=%u)\n", cap);
+            fprintf(stderr, "ERROR: FlatHashMap alloc failed (cap=%zu)\n", cap);
             exit(1);
         }
     }
@@ -266,7 +266,7 @@ struct FlatHashMap {
     void insert_or_increment(KeyT key) {
         if (capacity == 0) init(1024);
         if (size * 10 >= capacity * 7) grow();
-        uint32_t h = hash_key(key) & (capacity - 1);
+        size_t h = hash_key(key) & (capacity - 1);
         while (true) {
             if (state[h] == 0) {
                 keys[h] = key; vals[h] = 1; state[h] = 1;
@@ -278,11 +278,23 @@ struct FlatHashMap {
         }
     }
 
+    bool empty() const { return size == 0; }
+
+    uint32_t lookup(KeyT key) const {
+        if (capacity == 0) return 0;
+        size_t h = hash_key(key) & (capacity - 1);
+        while (true) {
+            if (state[h] == 0) return 0;
+            if (keys[h] == key) return vals[h];
+            h = (h + 1) & (capacity - 1);
+        }
+    }
+
     void extract_sorted(uint32_t min_count,
                         std::vector<std::pair<KeyT, uint32_t>> &out) const {
         out.clear();
         out.reserve(size);
-        for (uint32_t i = 0; i < capacity; i++) {
+        for (size_t i = 0; i < capacity; i++) {
             if (state[i] && vals[i] >= min_count)
                 out.push_back({keys[i], vals[i]});
         }
@@ -291,7 +303,7 @@ struct FlatHashMap {
 
 private:
     void grow() {
-        uint32_t old_cap = capacity;
+        size_t old_cap = capacity;
         KeyT *old_keys = keys;
         uint32_t *old_vals = vals;
         uint8_t *old_state = state;
@@ -301,13 +313,13 @@ private:
         vals  = static_cast<uint32_t *>(calloc(capacity, sizeof(uint32_t)));
         state = static_cast<uint8_t *>(calloc(capacity, sizeof(uint8_t)));
         if (!keys || !vals || !state) {
-            fprintf(stderr, "ERROR: FlatHashMap grow failed (cap=%u)\n", capacity);
+            fprintf(stderr, "ERROR: FlatHashMap grow failed (cap=%zu)\n", capacity);
             exit(1);
         }
         size = 0;
-        for (uint32_t i = 0; i < old_cap; i++) {
+        for (size_t i = 0; i < old_cap; i++) {
             if (old_state[i]) {
-                uint32_t h = hash_key(old_keys[i]) & (capacity - 1);
+                size_t h = hash_key(old_keys[i]) & (capacity - 1);
                 while (state[h]) h = (h + 1) & (capacity - 1);
                 keys[h] = old_keys[i]; vals[h] = old_vals[i]; state[h] = 1;
                 size++;
@@ -316,15 +328,15 @@ private:
         free(old_keys); free(old_vals); free(old_state);
     }
 
-    static uint32_t hash_key(uint32_t k) {
+    static size_t hash_key(uint32_t k) {
         k ^= k >> 16; k *= 0x45d9f3b; k ^= k >> 16;
         k *= 0x45d9f3b; k ^= k >> 16;
         return k;
     }
-    static uint32_t hash_key(uint64_t k) {
+    static size_t hash_key(uint64_t k) {
         k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33;
         k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33;
-        return static_cast<uint32_t>(k);
+        return static_cast<size_t>(k);
     }
 };
 

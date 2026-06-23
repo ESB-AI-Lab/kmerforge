@@ -272,7 +272,7 @@ Each bucket uses a struct-of-arrays (SoA) open-addressing hash map with linear p
 | `vals[]` | `uint32_t` | Counts |
 | `state[]` | `uint8_t` | 0 = empty, 1 = occupied |
 
-At 70% load factor, this costs ~9 bytes per slot (vs ~48 bytes per entry in `std::unordered_map`). Buckets use lazy initialization — empty buckets allocate nothing, so small inputs use minimal memory regardless of k.
+At 70% load factor, this costs ~9 bytes per slot (vs ~48 bytes per entry in `std::unordered_map`). Capacity and size use `size_t` to support tables beyond 4 billion entries (e.g., human-scale k-mer sets). Buckets use lazy initialization — empty buckets allocate nothing, so small inputs use minimal memory regardless of k.
 
 **Estimated RAM for a human genome (~3 billion distinct 21-mers):**
 
